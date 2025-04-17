@@ -4,26 +4,27 @@ import cv2
 import os
 import pytesseract
 import re
+import sys
+import cloudinary
+import cloudinary.uploader
+
 from Levenshtein import ratio as levenshtein_ratio
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
 
 # --------------------------
 # Configuration
 # --------------------------
 
-# Paths (adjust if necessary)
-FFMPEG_PATH =r"C:\ffmpeg-2025-02-13-git-19a2d26177-full_build\ffmpeg-2025-02-13-git-19a2d26177-full_build\bin\ffmpeg.exe"
-
-VIDEO_PATH = "test_video2.mp4"
-AUDIO_PATH = "extracted_audio.wav"
-TRANSCRIPT_FILE = "transcription.txt"
-SUMMARY_PDF = "video_summary.pdf"
-
-# Tesseract configuration
+FFMPEG_PATH = r"C:\ffmpeg-2025-02-13-git-19a2d26177-full_build\ffmpeg-2025-02-13-git-19a2d26177-full_build\bin\ffmpeg.exe"
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+cloudinary.config(
+    cloud_name="duoenlwuj",
+    api_key="536698638836779",
+    api_secret="_ZfLsWPirfhd08G2JKkgZrG_zTs"
+)
 
 # --------------------------
 # Audio & Transcript
@@ -31,32 +32,22 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 
 def extract_audio_from_video(video_path, audio_path):
     command = [
-        FFMPEG_PATH,
-        '-i', video_path,
-        '-vn',
-        '-acodec', 'pcm_s16le',
-        '-ar', '44100',
-        '-ac', '2',
-        audio_path
+        FFMPEG_PATH, '-i', video_path, '-vn',
+        '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', audio_path
     ]
     subprocess.run(command, check=True)
-    print(f"Audio extracted and saved to {audio_path}")
+    print(f"[AUDIO] Extracted to {audio_path}", file=sys.stderr)
 
-def transcribe_audio_to_segments(audio_path):
-    print("[INFO] Loading Whisper model...")
+def transcribe_audio_to_segments(audio_path, transcript_txt):
+    print("[TRANSCRIBE] Loading Whisper model...", file=sys.stderr)
     model = whisper.load_model("base")
-
-    print("[INFO] Transcribing audio...")
     result = model.transcribe(audio_path)
-    
-    full_text = result["text"]
-    with open(TRANSCRIPT_FILE, 'w', encoding="utf-8") as file:
-        file.write(full_text)
-    print(f"[INFO] Full transcript saved to {TRANSCRIPT_FILE}")
-    
-    segments = result.get("segments", [])
-    print(f"[INFO] Retrieved {len(segments)} transcript segments")
-    return segments
+
+    with open(transcript_txt, 'w', encoding="utf-8") as file:
+        file.write(result["text"])
+
+    print(f"[TRANSCRIBE] Saved full transcript to {transcript_txt}", file=sys.stderr)
+    return result.get("segments", [])
 
 # --------------------------
 # Screenshot Extraction & OCR
@@ -82,16 +73,14 @@ def significant_change(prev_text, curr_text, line_change_ratio=0.5):
 
     new_lines = [line for line in curr_lines if line not in prev_lines]
     added_ratio = len(new_lines) / max(len(prev_lines), 1)
-    
     return added_ratio > line_change_ratio
 
 def extract_screenshots(video_path, output_dir='screenshots', interval=2):
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
+    os.makedirs(output_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
+
     if not cap.isOpened():
-        print("❌ Failed to open video.")
+        print("Cannot open video.", file=sys.stderr)
         return []
 
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -99,10 +88,9 @@ def extract_screenshots(video_path, output_dir='screenshots', interval=2):
     count, saved = 0, 0
     prev_text = ""
     saved_texts = []
+    data = []
 
-    screenshot_data = []
-
-    print(f"🎞 Processing video at {fps} FPS, extracting every {interval} sec (every {frame_interval} frames).")
+    print(f"[SCREENSHOT] FPS: {fps}, Interval: {interval}s", file=sys.stderr)
 
     while True:
         ret, frame = cap.read()
@@ -111,51 +99,50 @@ def extract_screenshots(video_path, output_dir='screenshots', interval=2):
 
         if count % frame_interval == 0:
             timestamp_sec = count / fps
-            print(f"\n🔍 Frame {count} at {timestamp_sec:.2f}s")
+            print(f"\n[FRAME] {count} ({timestamp_sec:.2f}s)", file=sys.stderr)
 
             if is_blurry(frame):
-                print("📷 Skipped: Blurry frame")
+                print(" Blurry, skipping", file=sys.stderr)
                 count += 1
                 continue
 
             curr_text = extract_text_from_image(frame)
             if not curr_text:
-                print("📄 Skipped: No text found")
+                print(" No text, skipping", file=sys.stderr)
                 count += 1
                 continue
 
-            cleaned_curr = clean_text(curr_text)
-            is_repeat = any(levenshtein_ratio(saved, cleaned_curr) > 0.85 for saved in saved_texts)
-            if is_repeat:
-                print("🔁 Skipped: Repeated content")
+            cleaned = clean_text(curr_text)
+            if any(levenshtein_ratio(saved, cleaned) > 0.85 for saved in saved_texts):
+                print(" Repeated, skipping", file=sys.stderr)
                 count += 1
                 continue
 
             if significant_change(prev_text, curr_text):
                 filename = os.path.join(output_dir, f'screenshot_{timestamp_sec:.2f}s.jpg')
                 cv2.imwrite(filename, frame)
-                screenshot_data.append({
+                data.append({
                     "time": timestamp_sec,
                     "image": filename,
                     "text": curr_text
                 })
                 prev_text = curr_text
-                saved_texts.append(cleaned_curr)
-                saved += 1
-                print(f"✅ Saved screenshot: {filename}")
+                saved_texts.append(cleaned)
+                print(f" Saved: {filename}", file=sys.stderr)
             else:
-                print("⚠️ Skipped: Only slight change")
+                print(" Slight change, skipping", file=sys.stderr)
+
         count += 1
 
     cap.release()
-    print(f"\n🎉 Done. Total screenshots saved: {saved}")
-    return screenshot_data
+    print(f"\n[SCREENSHOT] Saved {len(data)} screenshots", file=sys.stderr)
+    return data
 
 # --------------------------
-# Merge and PDF Generation
+# Merge Timeline & Generate PDF
 # --------------------------
 
-def merge_timeline(transcript_segments, screenshot_data):
+def merge_timeline(transcript_segments, screenshots):
     timeline = []
     for seg in transcript_segments:
         timeline.append({
@@ -163,15 +150,14 @@ def merge_timeline(transcript_segments, screenshot_data):
             "time": seg["start"],
             "content": seg["text"]
         })
-    for shot in screenshot_data:
+    for shot in screenshots:
         timeline.append({
             "type": "screenshot",
             "time": shot["time"],
             "content": shot["image"],
             "text": shot["text"]
         })
-    timeline.sort(key=lambda x: x["time"])
-    return timeline
+    return sorted(timeline, key=lambda x: x["time"])
 
 def generate_pdf_summary(timeline, output_file):
     c = canvas.Canvas(output_file, pagesize=letter)
@@ -193,9 +179,9 @@ def generate_pdf_summary(timeline, output_file):
             y = height - margin
 
         if entry["type"] == "transcript":
-            wrapped_text = re.findall('.{1,100}(?:\s+|$)', entry["content"])
+            wrapped = re.findall(r'.{1,100}(?:\s+|$)', entry["content"])
             line = ''
-            for word in wrapped_text:
+            for word in wrapped:
                 if c.stringWidth(line + word.strip(), "Helvetica", text_font_size) < (width - 2 * margin):
                     line += word.strip() + ' '
                 else:
@@ -225,20 +211,90 @@ def generate_pdf_summary(timeline, output_file):
 
                 c.drawImage(img, margin, y - img_height, width=img_width, height=img_height)
                 y -= img_height + 20
-            except Exception as e:
-                c.drawString(margin, y, f"[Error loading image: {entry['content']}]")
+            except Exception:
+                c.drawString(margin, y, f"[Error loading image: {entry['content']}]", file=sys.stderr)
                 y -= 20
 
     c.save()
-    print(f"[INFO] PDF summary generated: {output_file}")
+    print(f"[PDF] Generated: {output_file}", file=sys.stderr)
 
 # --------------------------
-# Main Workflow
+# Pipeline Entry Point
+# --------------------------
+
+import os
+
+def run_pipeline(video_path, pdf_name):
+    audio_path = "temp_audio.wav"
+    transcript_txt = "transcript.txt"
+    screenshots_dir = "screenshots"
+    
+    try:
+        # Extract audio from video
+        extract_audio_from_video(video_path, audio_path)
+
+        # Transcribe audio to segments
+        segments = transcribe_audio_to_segments(audio_path, transcript_txt)
+
+        # Extract screenshots
+        screenshots = extract_screenshots(video_path, output_dir=screenshots_dir, interval=2)
+
+        # Merge timeline and generate PDF
+        timeline = merge_timeline(segments, screenshots)
+        generate_pdf_summary(timeline, pdf_name)
+
+        # Upload PDF to Cloudinary
+        result = cloudinary.uploader.upload(pdf_name, resource_type="auto")
+        cloudinary_url = result["secure_url"]
+
+    finally:
+        # Clean up temporary files
+        try:
+            # Delete the audio file, transcript, screenshots, and PDF
+            os.remove(audio_path)
+            os.remove(transcript_txt)
+            os.remove(pdf_name)
+            
+            # Delete screenshots directory if empty
+            for screenshot in os.listdir(screenshots_dir):
+                os.remove(os.path.join(screenshots_dir, screenshot))
+            os.rmdir(screenshots_dir)
+
+        except Exception as cleanup_error:
+            print(f"[CLEANUP ERROR] Failed to delete temporary files: {cleanup_error}", file=sys.stderr)
+
+    return cloudinary_url
+
+# --------------------------
+# Main
 # --------------------------
 
 if __name__ == "__main__":
-    extract_audio_from_video(VIDEO_PATH, AUDIO_PATH)
-    transcript_segments = transcribe_audio_to_segments(AUDIO_PATH)
-    screenshot_data = extract_screenshots(VIDEO_PATH, output_dir="screenshots", interval=2)
-    timeline = merge_timeline(transcript_segments, screenshot_data)
-    generate_pdf_summary(timeline, SUMMARY_PDF)
+    import json
+
+    if len(sys.argv) != 3:
+        print(json.dumps({
+            "success": False,
+            "error": "Invalid arguments. Usage: python server.py <video_path> <pdf_output_path>"
+        }))
+        sys.exit(1)
+
+    video_path = sys.argv[1]
+    pdf_name = sys.argv[2]
+
+    try:
+        url = run_pipeline(video_path, pdf_name)
+
+        # ✅ Only this output goes to stdout for Node.js
+        print(json.dumps({
+            "success": True,
+            "url": url
+        }))
+
+    except Exception as e:
+        print(json.dumps({
+            "success": False,
+            "error": "Video summarization failed.",
+            "details": str(e)
+        }))
+        sys.exit(1)
